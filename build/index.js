@@ -1,13 +1,19 @@
 (function() {
-  'use strict';
-  var module;
+  var e, module;
 
-  module = angular.module('ndx-server', ['ngCookies']);
+  module = null;
+
+  try {
+    module = angular.module('ndx');
+  } catch (error) {
+    e = error;
+    module = angular.module('ndx', []);
+  }
 
   module.provider('Server', function() {
     return {
-      $get: function($http, $q, $rootElement, $window, $cookies, LocalSettings, Auth, ndxdb, socket) {
-        var Ndx, Req, Res, autoId, deleteFn, endpoints, fetchNewData, fetchNewForEndpoint, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, uploadEndpoints, upsertFn;
+      $get: function($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) {
+        var Ndx, Req, Res, autoId, deleteFn, endpoints, fetchAndUpload, fetchCount, fetchNewData, fetchNewForEndpoint, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, uploadEndpoints, upsertFn;
         autoId = ((ref = LocalSettings.getGlobal('endpoints')) != null ? ref.autoId : void 0) || '_id';
         offline = LocalSettings.getGlobal('offline');
         endpoints = [];
@@ -31,10 +37,7 @@
           };
         };
         isOnline = function() {
-          if (!offline) {
-            return $window.navigator.onLine;
-          }
-          return false;
+          return !offline;
         };
         Req = function(method, uri, config, params) {
           return {
@@ -65,6 +68,9 @@
                 status: status,
                 data: data
               });
+            },
+            reject: function(data) {
+              return defer.reject(data);
             }
           };
         };
@@ -260,11 +266,16 @@
               where[ndx.settings.AUTO_ID] = req.params.id;
             }
             req.body.modifiedAt = 0;
+            req.body.insertedAt = req.body.insertedAt || new Date().valueOf();
             ndx.database.upsert(myTableName, req.body, where, function(err, r) {
               return res.json(err || r);
             });
             if (isOnline()) {
-              return original.$post(req.uri, req.body);
+              return original.$post(req.uri, req.body).then(function() {
+                return true;
+              }, function() {
+                return false;
+              });
             }
           };
         };
@@ -351,11 +362,11 @@
         };
         fetchNewForEndpoint = function(endpoint, all, endpointCb) {
           var localEndpoint;
+          if (!Auth.getUser()) {
+            return typeof endpointCb === "function" ? endpointCb() : void 0;
+          }
           localEndpoint = endpoint;
           if (!all) {
-            if (!Auth.getUser()) {
-              return typeof endpointCb === "function" ? endpointCb() : void 0;
-            }
             localEndpoint = `${endpoint}_${(Auth.getUser()._id)}`;
           }
           return ndx.database.maxModified(localEndpoint, function(localMaxModified) {
@@ -381,7 +392,7 @@
             });
           });
         };
-        fetchNewData = function() {
+        fetchNewData = function(cb) {
           if (endpoints && endpoints.endpoints) {
             return async.each(endpoints.endpoints, function(endpoint, endpointCb) {
               return fetchNewForEndpoint(endpoint, true, function() {
@@ -390,16 +401,32 @@
                 });
               });
             }, function() {
-              return true;
+              return typeof cb === "function" ? cb() : void 0;
             });
           }
         };
+        fetchCount = 0;
+        fetchAndUpload = function(data) {
+          if (data) {
+            return fetchNewForEndpoint(data.table, true, function() {
+              return fetchNewForEndpoint(data.table, false, function() {
+                return uploadEndpoints(function() {
+                  return rest.socketRefresh(data);
+                });
+              });
+            });
+          } else {
+            if (fetchCount++ > 0) {
+              return fetchNewData(function() {
+                return rest.socketRefresh(data);
+              });
+            }
+          }
+        };
         $http.post = function(uri, config) {
-          //console.log 'post', uri, config
           return ndx.app.routeRequest('post', uri, config);
         };
         $http.get = function(uri, config) {
-          //console.log 'get', uri
           return ndx.app.routeRequest('get', uri, config);
         };
         $http.put = function(uri, config) {
@@ -408,30 +435,10 @@
         $http.delete = function(uri, config) {
           return ndx.app.routeRequest('delete', uri, config);
         };
-        socket.on('connect', function() {
-          return uploadEndpoints();
-        });
-        socket.on('update', function(data) {
-          return fetchNewForEndpoint(data.table, true, function() {
-            return fetchNewForEndpoint(data.table, false, function() {
-              return uploadEndpoints();
-            });
-          });
-        });
-        socket.on('insert', function(data) {
-          return fetchNewForEndpoint(data.table, true, function() {
-            return fetchNewForEndpoint(data.table, false, function() {
-              return uploadEndpoints();
-            });
-          });
-        });
-        socket.on('delete', function(data) {
-          return fetchNewForEndpoint(data.table, true, function() {
-            return fetchNewForEndpoint(data.table, false, function() {
-              return uploadEndpoints();
-            });
-          });
-        });
+        socket.on('connect', fetchAndUpload);
+        socket.on('update', fetchAndUpload);
+        socket.on('insert', fetchAndUpload);
+        socket.on('delete', fetchAndUpload);
         Auth.onUser(function() {
           makeTables();
           return fetchNewData();
@@ -443,7 +450,7 @@
               endpoints = response.data;
               makeEndpointRoutes();
               makeTables();
-              fetchNewData();
+              fetchAndUpload();
               return res.json(response.data);
             }, function() {
               endpoints = LocalSettings.getGlobal('endpoints');
@@ -500,6 +507,47 @@
               return res.status(401).json({});
             }
           }
+        });
+        ndx.app.get('/api/logout', function(req, res, next) {
+          LocalSettings.setGlobal('loggedInUser', null);
+          original.$get(req.uri, req.data).then(function() {
+            return true;
+          }, function() {
+            return false;
+          });
+          return res.end('OK');
+        });
+        ndx.app.post('/api/login', function(req, res, next) {
+          return original.$post(req.uri, req.body).then(function(response) {
+            return res.json(response.data);
+          }, function(err) {
+            var key, ref1, ref2, ref3, user, users;
+            if (err.status === 401) {
+              return res.reject(err);
+            } else {
+              users = LocalSettings.getGlobal('users');
+              user = null;
+              for (key in users) {
+                user = users[key];
+                if (((ref1 = user.local) != null ? (ref2 = ref1.email) != null ? ref2.toLowerCase() : void 0 : void 0) === ((ref3 = req.body.email) != null ? ref3.toLowerCase() : void 0)) {
+                  break;
+                }
+              }
+              if (user) {
+                if (dcodeIO.bcrypt.compareSync(req.body.password, user.local.password)) {
+                  LocalSettings.setGlobal('loggedInUser', {
+                    user: user,
+                    until: new Date().valueOf() + (5 * 60 * 60 * 1000)
+                  });
+                  return res.json(user);
+                } else {
+                  return res.reject(err);
+                }
+              } else {
+                return res.reject(err);
+              }
+            }
+          });
         });
         return {
           setOffline: function(val) {

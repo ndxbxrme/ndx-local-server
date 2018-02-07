@@ -1,7 +1,10 @@
-'use strict'
-module = angular.module 'ndx-server', ['ngCookies']
+module = null
+try
+  module = angular.module 'ndx'
+catch e
+  module =angular.module 'ndx', []
 module.provider 'Server', ->
-  $get: ($http, $q, $rootElement, $window, $cookies, LocalSettings, Auth, ndxdb, socket) ->
+  $get: ($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) ->
     autoId = LocalSettings.getGlobal('endpoints')?.autoId or '_id'
     offline = LocalSettings.getGlobal('offline')
     endpoints = []
@@ -21,9 +24,7 @@ module.provider 'Server', ->
         params: params
         fns: []
     isOnline = ->
-      if not offline
-        return $window.navigator.onLine
-      false
+      not offline
     Req = (method, uri, config, params) ->
       uri: uri
       method: method
@@ -44,6 +45,8 @@ module.provider 'Server', ->
         defer.resolve
           status: status
           data: data
+      reject: (data) ->
+        defer.reject data
     Ndx = ->
       routes =
         get: []
@@ -163,10 +166,15 @@ module.provider 'Server', ->
         if req.params.id
           where[ndx.settings.AUTO_ID] = req.params.id
         req.body.modifiedAt = 0
+        req.body.insertedAt = req.body.insertedAt or new Date().valueOf()
         ndx.database.upsert myTableName, req.body, where, (err, r) ->
           res.json(err or r)
         if isOnline()
           original.$post req.uri, req.body
+          .then ->
+            true
+          , ->
+            false
     deleteFn = (tableName) ->
       (req, res, next) ->
         myTableName = "#{tableName}_#{Auth.getUser()._id}"
@@ -216,10 +224,10 @@ module.provider 'Server', ->
         , ->
           cb?()
     fetchNewForEndpoint = (endpoint, all, endpointCb) ->
+      if not Auth.getUser()
+        return endpointCb?()
       localEndpoint = endpoint
       if not all
-        if not Auth.getUser()
-          return endpointCb?()
         localEndpoint = "#{endpoint}_#{Auth.getUser()._id}"
       ndx.database.maxModified localEndpoint, (localMaxModified) ->
         original.$post "/api/#{endpoint}/search#{if all then '/all' else ''}",
@@ -237,38 +245,37 @@ module.provider 'Server', ->
             endpointCb?()
         , ->
           endpointCb?()
-    fetchNewData = ->
+    fetchNewData = (cb) ->
       if endpoints and endpoints.endpoints
         async.each endpoints.endpoints, (endpoint, endpointCb) ->
           fetchNewForEndpoint endpoint, true, ->
             fetchNewForEndpoint endpoint, false, ->
               uploadEndpoints endpointCb
         , ->
-          true
+          cb?()
+    fetchCount = 0
+    fetchAndUpload = (data) ->
+      if data
+        fetchNewForEndpoint data.table, true, ->
+          fetchNewForEndpoint data.table, false, ->
+            uploadEndpoints ->
+              rest.socketRefresh data
+      else
+        if fetchCount++ > 0
+          fetchNewData ->
+            rest.socketRefresh data
     $http.post = (uri, config) ->
-      #console.log 'post', uri, config
       ndx.app.routeRequest 'post', uri, config
     $http.get = (uri, config) ->
-      #console.log 'get', uri
       ndx.app.routeRequest 'get', uri, config
     $http.put = (uri, config) ->
       ndx.app.routeRequest 'put', uri, config
     $http.delete = (uri, config) ->
       ndx.app.routeRequest 'delete', uri, config
-    socket.on 'connect', ->
-      uploadEndpoints()
-    socket.on 'update', (data) ->
-      fetchNewForEndpoint data.table, true, ->
-        fetchNewForEndpoint data.table, false, ->
-          uploadEndpoints()
-    socket.on 'insert', (data) ->
-      fetchNewForEndpoint data.table, true, ->
-        fetchNewForEndpoint data.table, false, ->
-          uploadEndpoints()
-    socket.on 'delete', (data) ->
-      fetchNewForEndpoint data.table, true, ->
-        fetchNewForEndpoint data.table, false, ->
-          uploadEndpoints()
+    socket.on 'connect', fetchAndUpload
+    socket.on 'update', fetchAndUpload
+    socket.on 'insert', fetchAndUpload
+    socket.on 'delete', fetchAndUpload
     Auth.onUser ->
       makeTables()
       fetchNewData()
@@ -280,7 +287,7 @@ module.provider 'Server', ->
           endpoints = response.data
           makeEndpointRoutes()
           makeTables()
-          fetchNewData()
+          fetchAndUpload()
           res.json response.data
         , ->
           endpoints = LocalSettings.getGlobal 'endpoints'
@@ -325,6 +332,38 @@ module.provider 'Server', ->
           res.json loggedInUser.user
         else
           res.status(401).json {}
+    ndx.app.get '/api/logout', (req, res, next) ->
+      LocalSettings.setGlobal 'loggedInUser', null
+      original.$get req.uri, req.data
+      .then ->
+        true
+      , ->
+        false
+      res.end 'OK'
+    ndx.app.post '/api/login', (req, res, next) ->
+      original.$post req.uri, req.body
+      .then (response) ->
+        res.json response.data
+      , (err) ->
+        if err.status is 401
+          res.reject err
+        else
+          users = LocalSettings.getGlobal 'users'
+          user = null
+          for key of users
+            user = users[key]
+            if user.local?.email?.toLowerCase() is req.body.email?.toLowerCase()
+              break
+          if user
+            if dcodeIO.bcrypt.compareSync req.body.password, user.local.password
+              LocalSettings.setGlobal 'loggedInUser', 
+                user: user
+                until: new Date().valueOf() + (5 * 60 * 60 * 1000)
+              res.json user
+            else
+              res.reject err
+          else
+            res.reject err
     setOffline: (val) ->
       offline = val
       LocalSettings.setGlobal 'offline', offline
