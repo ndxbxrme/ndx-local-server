@@ -1,6 +1,6 @@
 {
   "name": "ndx-local-server",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "local/offline server for ndx-framework apps",
   "main": "build/index.js",
   "scripts": {

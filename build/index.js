@@ -11,9 +11,13 @@
   }
 
   module.provider('Server', function() {
+    var config;
+    config = {
+      sharedAll: true
+    };
     return {
       $get: function($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) {
-        var Ndx, Req, Res, autoId, deleteFn, endpoints, fetchAndUpload, fetchCount, fetchNewData, fetchNewForEndpoint, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, uploadEndpoints, upsertFn;
+        var Ndx, Req, Res, autoId, checkRefresh, deleteEndpoint, deleteFn, endpoints, fetchAndUpload, fetchCount, fetchNewData, fetchNewForEndpoint, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, uploadEndpoints, upsertFn;
         autoId = ((ref = LocalSettings.getGlobal('endpoints')) != null ? ref.autoId : void 0) || '_id';
         offline = LocalSettings.getGlobal('offline');
         endpoints = [];
@@ -117,7 +121,8 @@
               ref2 = route.params;
               for (i = k = 0, len1 = ref2.length; k < len1; i = ++k) {
                 param = ref2[i];
-                params[param] = ex[i + 1];
+                console.log(decodeURIComponent(ex[i + 1]));
+                params[param] = decodeURIComponent(ex[i + 1]);
               }
               req = Req(method, uri, config, params);
               res = Res(method, uri, config, defer);
@@ -212,8 +217,11 @@
           return function(req, res, next) {
             var myTableName, where;
             myTableName = tableName;
-            if (!all) {
+            if (!all || !config.sharedAll) {
               myTableName += `_${(Auth.getUser()._id)}`;
+            }
+            if (all) {
+              myTableName += "_all";
             }
             if (req.params && req.params.id) {
               where = {};
@@ -311,8 +319,13 @@
           for (j = 0, len = ref1.length; j < len; j++) {
             endpoint = ref1[j];
             ndx.app.get([`/api/${endpoint}`, `/api/${endpoint}/:id`], selectFn(endpoint));
-            ndx.app.get(`/api/${endpoint}/:id/all`, selectFn(endpoint, true));
             ndx.app.post(`/api/${endpoint}/search`, selectFn(endpoint));
+            if (endpoints.restrict && endpoints.restrict[endpoint] && endpoints.restrict[endpoint].all) {
+              true;
+            } else {
+              ndx.app.get(`/api/${endpoint}/:id/all`, selectFn(endpoint, true));
+              ndx.app.post(`/api/${endpoint}/search/all`, selectFn(endpoint, true));
+            }
             //ndx.app.post "/api/#{endpoint}/modified", modifiedFn(endpoint)
             ndx.app.post([`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
             ndx.app.put([`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
@@ -321,12 +334,17 @@
           return results;
         };
         makeTables = function() {
-          var endpoint, j, k, len, len1, ref1, ref2, results;
+          var endpoint, j, k, len, len1, myTableName, ref1, ref2, results;
           if (endpoints && endpoints.endpoints) {
             ref1 = endpoints.endpoints;
             for (j = 0, len = ref1.length; j < len; j++) {
               endpoint = ref1[j];
-              ndx.database.makeTable(endpoint);
+              myTableName = endpoint;
+              if (!config.sharedAll) {
+                myTableName += `_${(Auth.getUser()._id)}`;
+              }
+              myTableName += "_all";
+              ndx.database.makeTable(myTableName);
             }
           }
           if (endpoints && endpoints.endpoints && Auth.getUser()) {
@@ -366,8 +384,11 @@
             return typeof endpointCb === "function" ? endpointCb() : void 0;
           }
           localEndpoint = endpoint;
-          if (!all) {
-            localEndpoint = `${endpoint}_${(Auth.getUser()._id)}`;
+          if (!all || !config.sharedAll) {
+            localEndpoint += `_${(Auth.getUser()._id)}`;
+          }
+          if (all) {
+            localEndpoint += "_all";
           }
           return ndx.database.maxModified(localEndpoint, function(localMaxModified) {
             return original.$post(`/api/${endpoint}/search${(all ? '/all' : '')}`, {
@@ -423,6 +444,39 @@
             }
           }
         };
+        deleteEndpoint = function(endpoint, all) {
+          var localEndpoint;
+          localEndpoint = endpoint;
+          if (!all || !config.sharedAll) {
+            localEndpoint += `_${(Auth.getUser()._id)}`;
+          }
+          if (all) {
+            localEndpoint += "_all";
+          }
+          return ndx.database.delete(localEndpoint);
+        };
+        checkRefresh = function() {
+          var endpoint, lastRefresh, ref1, refreshed, results, user;
+          if (endpoints && endpoints.endpoints && (user = Auth.getUser())) {
+            lastRefresh = LocalSettings.getGlobal('lastRefresh') || 0;
+            if (user.ndxRefresh) {
+              results = [];
+              for (endpoint in user.ndxRefresh) {
+                refreshed = false;
+                if ((lastRefresh < (ref1 = user.ndxRefresh[endpoint]) && ref1 < new Date().valueOf())) {
+                  deleteEndpoint(endpoint, true);
+                  deleteEndpoint(endpoint, false);
+                }
+                if (refreshed) {
+                  results.push(LocalSettings.setGlobal('lastRefresh', new Date().valueOf()));
+                } else {
+                  results.push(void 0);
+                }
+              }
+              return results;
+            }
+          }
+        };
         $http.post = function(uri, config) {
           return ndx.app.routeRequest('post', uri, config);
         };
@@ -441,6 +495,8 @@
         socket.on('delete', fetchAndUpload);
         Auth.onUser(function() {
           makeTables();
+          //check for refresh
+          checkRefresh();
           return fetchNewData();
         });
         ndx.app.get('/rest/endpoints', function(req, res, next) {
@@ -450,6 +506,7 @@
               endpoints = response.data;
               makeEndpointRoutes();
               makeTables();
+              checkRefresh();
               fetchAndUpload();
               return res.json(response.data);
             }, function() {
@@ -555,7 +612,10 @@
             return LocalSettings.setGlobal('offline', offline);
           },
           isOnline: isOnline,
-          original: original
+          original: original,
+          config: function(_config) {
+            return config = _config;
+          }
         };
       }
     };

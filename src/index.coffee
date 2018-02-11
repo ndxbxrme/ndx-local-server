@@ -4,6 +4,8 @@ try
 catch e
   module =angular.module 'ndx', []
 module.provider 'Server', ->
+  config =
+    sharedAll: true
   $get: ($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) ->
     autoId = LocalSettings.getGlobal('endpoints')?.autoId or '_id'
     offline = LocalSettings.getGlobal('offline')
@@ -75,7 +77,8 @@ module.provider 'Server', ->
           ex = route.regex.exec uri
           params = {}
           for param, i in route.params
-            params[param] = ex[i+1]
+            console.log decodeURIComponent(ex[i+1])
+            params[param] = decodeURIComponent(ex[i+1])
           req = Req method, uri, config, params
           res = Res method, uri, config, defer
           callFn 0, req, res
@@ -127,8 +130,10 @@ module.provider 'Server', ->
     selectFn = (tableName, all) ->
       (req, res, next) ->
         myTableName = tableName
-        if not all
+        if not all or not config.sharedAll
           myTableName += "_#{Auth.getUser()._id}"
+        if all
+          myTableName += "_all"
         if req.params and req.params.id
           where = {}
           if req.params.id.indexOf('{') is 0
@@ -196,8 +201,12 @@ module.provider 'Server', ->
     makeEndpointRoutes = ->
       for endpoint in endpoints.endpoints
         ndx.app.get ["/api/#{endpoint}", "/api/#{endpoint}/:id"], selectFn(endpoint)
-        ndx.app.get "/api/#{endpoint}/:id/all", selectFn(endpoint, true)
         ndx.app.post "/api/#{endpoint}/search", selectFn(endpoint)
+        if endpoints.restrict and endpoints.restrict[endpoint] and endpoints.restrict[endpoint].all
+          true
+        else
+          ndx.app.get "/api/#{endpoint}/:id/all", selectFn(endpoint, true)
+          ndx.app.post "/api/#{endpoint}/search/all", selectFn(endpoint, true)
         #ndx.app.post "/api/#{endpoint}/modified", modifiedFn(endpoint)
         ndx.app.post ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
         ndx.app.put ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
@@ -205,7 +214,11 @@ module.provider 'Server', ->
     makeTables = ->
       if endpoints and endpoints.endpoints
         for endpoint in endpoints.endpoints
-          ndx.database.makeTable endpoint
+          myTableName = endpoint
+          if not config.sharedAll
+            myTableName += "_#{Auth.getUser()._id}"
+          myTableName += "_all"
+          ndx.database.makeTable myTableName
       if endpoints and endpoints.endpoints and Auth.getUser()
         for endpoint in endpoints.endpoints
           ndx.database.makeTable "#{endpoint}_#{Auth.getUser()._id}"
@@ -227,8 +240,10 @@ module.provider 'Server', ->
       if not Auth.getUser()
         return endpointCb?()
       localEndpoint = endpoint
-      if not all
-        localEndpoint = "#{endpoint}_#{Auth.getUser()._id}"
+      if not all or not config.sharedAll
+        localEndpoint += "_#{Auth.getUser()._id}"
+      if all
+        localEndpoint += "_all"
       ndx.database.maxModified localEndpoint, (localMaxModified) ->
         original.$post "/api/#{endpoint}/search#{if all then '/all' else ''}",
           where:
@@ -264,6 +279,24 @@ module.provider 'Server', ->
         if fetchCount++ > 0
           fetchNewData ->
             rest.socketRefresh data
+    deleteEndpoint = (endpoint, all) ->
+      localEndpoint = endpoint
+      if not all or not config.sharedAll
+        localEndpoint += "_#{Auth.getUser()._id}"
+      if all
+        localEndpoint += "_all"
+      ndx.database.delete localEndpoint
+    checkRefresh = ->
+      if endpoints and endpoints.endpoints and user = Auth.getUser()
+        lastRefresh = LocalSettings.getGlobal('lastRefresh') or 0
+        if user.ndxRefresh
+          for endpoint of user.ndxRefresh
+            refreshed = false
+            if lastRefresh < user.ndxRefresh[endpoint] < new Date().valueOf()
+              deleteEndpoint endpoint, true
+              deleteEndpoint endpoint, false
+            if refreshed
+              LocalSettings.setGlobal 'lastRefresh', new Date().valueOf()
     $http.post = (uri, config) ->
       ndx.app.routeRequest 'post', uri, config
     $http.get = (uri, config) ->
@@ -278,6 +311,8 @@ module.provider 'Server', ->
     socket.on 'delete', fetchAndUpload
     Auth.onUser ->
       makeTables()
+      #check for refresh
+      checkRefresh()
       fetchNewData()
     ndx.app.get '/rest/endpoints', (req, res, next) ->
       if isOnline()
@@ -287,6 +322,7 @@ module.provider 'Server', ->
           endpoints = response.data
           makeEndpointRoutes()
           makeTables()
+          checkRefresh()
           fetchAndUpload()
           res.json response.data
         , ->
@@ -369,5 +405,7 @@ module.provider 'Server', ->
       LocalSettings.setGlobal 'offline', offline
     isOnline: isOnline
     original: original
+    config: (_config) ->
+      config = _config
 .run (Server) ->
   Server.setOffline false
