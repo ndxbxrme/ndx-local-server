@@ -9,7 +9,7 @@ module.provider 'Server', ->
   $get: ($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) ->
     autoId = LocalSettings.getGlobal('endpoints')?.autoId or '_id'
     offline = LocalSettings.getGlobal('offline')
-    endpoints = []
+    endpoints = null
     original =
       $post: $http.post
       $get: $http.get
@@ -27,11 +27,13 @@ module.provider 'Server', ->
         fns: []
     isOnline = ->
       not offline
-    Req = (method, uri, config, params) ->
+    Req = (method, uri, config, params, endpoint, restrict) ->
       uri: uri
       method: method
+      endpoint: endpoint
       body: config or {}
       params: params
+      restrict: restrict
     Res = (method, uri, config, defer) ->
       status = 200
       method: method
@@ -57,9 +59,10 @@ module.provider 'Server', ->
         delete: []
       makeRoute = (method, route, args) ->
         myroute = makeRegex route
-        i = 0
+        i = 1
         while i++ < args.length - 1
           myroute.fns.push args[i]
+        myroute.endpoint = args[0]
         routes[method].push myroute
       routeRequest = (method, uri, config) ->
         route = null
@@ -68,6 +71,9 @@ module.provider 'Server', ->
             route = testroute
             break
         if route
+          restrict = getRestrict route.endpoint
+          if restrict.local
+            return original['$' + method] uri, config
           defer = $q.defer()
           callFn = (index, req, res) ->
             if route.fns[index]
@@ -79,7 +85,7 @@ module.provider 'Server', ->
           for param, i in route.params
             console.log decodeURIComponent(ex[i+1])
             params[param] = decodeURIComponent(ex[i+1])
-          req = Req method, uri, config, params
+          req = Req method, uri, config, params, route.endpoint, restrict
           res = Res method, uri, config, defer
           callFn 0, req, res
           return defer.promise
@@ -87,25 +93,25 @@ module.provider 'Server', ->
           return original['$' + method] uri, config  
       app:
         routeRequest: routeRequest
-        get: (route) ->
+        get: (endpoint, route) ->
           if Object.prototype.toString.call(route) is '[object Array]'
             for r in route
               makeRoute 'get', r, arguments
           else
             makeRoute 'get', route, arguments
-        post: (route) ->
+        post: (endpoint, route) ->
           if Object.prototype.toString.call(route) is '[object Array]'
             for r in route
               makeRoute 'post', r, arguments
           else
             makeRoute 'post', route, arguments
-        put: (route) ->
+        put: (endpoint, route) ->
           if Object.prototype.toString.call(route) is '[object Array]'
             for r in route
               makeRoute 'put', r, arguments
           else
             makeRoute 'put', route, arguments
-        delete: (route) ->
+        delete: (endpoint, route) ->
           if Object.prototype.toString.call(route) is '[object Array]'
             for r in route
               makeRoute 'delete', r, arguments
@@ -127,10 +133,32 @@ module.provider 'Server', ->
             if truth = hasDeleted obj[key]
               return true
       truth
+    getRestrict = (tableName) ->
+      if endpoints
+        if endpoints.restrict
+          role = null
+          restrict = null
+          if user = Auth.getUser()
+            if user.roles
+              for key of user.roles
+                if user.roles[key]
+                  role = key
+                  break
+          tableRestrict = endpoints.restrict[tableName] or endpoints.restrict.default
+          if tableRestrict
+            return tableRestrict[role] or tableRestrict.default or {}
+      return {}
     selectFn = (tableName, all) ->
       (req, res, next) ->
         myTableName = tableName
-        if not all or not config.sharedAll
+        restrict = req.restrict
+        if all and restrict.all
+          return res.json
+            total: 0
+            page: 1
+            pageSize: 0
+            items: []
+        if not all or not restrict.sharedAll
           myTableName += "_#{Auth.getUser()._id}"
         if all
           myTableName += "_all"
@@ -200,31 +228,37 @@ module.provider 'Server', ->
         res.end 'OK'
     makeEndpointRoutes = ->
       for endpoint in endpoints.endpoints
-        ndx.app.get ["/api/#{endpoint}", "/api/#{endpoint}/:id"], selectFn(endpoint)
-        ndx.app.post "/api/#{endpoint}/search", selectFn(endpoint)
-        if endpoints.restrict and endpoints.restrict[endpoint] and endpoints.restrict[endpoint].all
-          true
-        else
-          ndx.app.get "/api/#{endpoint}/:id/all", selectFn(endpoint, true)
-          ndx.app.post "/api/#{endpoint}/search/all", selectFn(endpoint, true)
-        #ndx.app.post "/api/#{endpoint}/modified", modifiedFn(endpoint)
-        ndx.app.post ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
-        ndx.app.put ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
-        ndx.app.delete "/api/#{endpoint}/:id", deleteFn(endpoint)
+        ndx.app.get endpoint, ["/api/#{endpoint}", "/api/#{endpoint}/:id"], selectFn(endpoint)
+        ndx.app.post endpoint, "/api/#{endpoint}/search", selectFn(endpoint)
+        ndx.app.get endpoint, "/api/#{endpoint}/:id/all", selectFn(endpoint, true)
+        ndx.app.post endpoint, "/api/#{endpoint}/search/all", selectFn(endpoint, true)
+        #ndx.app.post endpoint, "/api/#{endpoint}/modified", modifiedFn(endpoint)
+        ndx.app.post endpoint, ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
+        ndx.app.put endpoint, ["/api/#{endpoint}", "/api/#{endpoint}/:id"], upsertFn(endpoint)
+        ndx.app.delete endpoint, "/api/#{endpoint}/:id", deleteFn(endpoint)
     makeTables = ->
       if endpoints and endpoints.endpoints
         for endpoint in endpoints.endpoints
           myTableName = endpoint
-          if not config.sharedAll
+          restrict = getRestrict myTableName
+          if restrict.all or restrict.localAll
+            continue
+          if not restrict.sharedAll
             myTableName += "_#{Auth.getUser()._id}"
           myTableName += "_all"
           ndx.database.makeTable myTableName
       if endpoints and endpoints.endpoints and Auth.getUser()
         for endpoint in endpoints.endpoints
+          restrict = getRestrict endpoint
+          if restrict.local
+            continue
           ndx.database.makeTable "#{endpoint}_#{Auth.getUser()._id}"
     uploadEndpoints = (cb) ->
       if endpoints and endpoints.endpoints and Auth.getUser()
         async.each endpoints.endpoints, (endpoint, endpointCb) ->
+          restrict = getRestrict endpoint
+          if restrict.local
+            return endpointCb()
           myTableName = "#{endpoint}_#{Auth.getUser()._id}"
           ndx.database.getDocsToUpload myTableName, (docs) ->
             if docs
@@ -236,30 +270,52 @@ module.provider 'Server', ->
               endpointCb()
         , ->
           cb?()
+    totalFetched = 0
     fetchNewForEndpoint = (endpoint, all, endpointCb) ->
       if not Auth.getUser()
         return endpointCb?()
       localEndpoint = endpoint
+      restrict = getRestrict localEndpoint
+      if restrict.local
+        return endpointCb?()
+      if all and (restrict.all or restrict.localAll)
+        return endpointCb?()
       if not all or not config.sharedAll
         localEndpoint += "_#{Auth.getUser()._id}"
       if all
         localEndpoint += "_all"
-      ndx.database.maxModified localEndpoint, (localMaxModified) ->
-        original.$post "/api/#{endpoint}/search#{if all then '/all' else ''}",
-          where:
-            modifiedAt:
-              $gt: localMaxModified
-        .then (modifiedDocs) ->
-          if modifiedDocs.data and modifiedDocs.data.total
-            async.each modifiedDocs.data.items, (modifiedDoc, upsertCb) ->
-              ndx.database.upsert localEndpoint, modifiedDoc
-              upsertCb()
-            , ->
-              endpointCb?()
+      PAGE_SIZE = 10
+      fetchPage = (firstPage) ->
+        ndx.database.maxModified localEndpoint, (localMaxModified) ->
+          where =
+            modifiedAt: {}
+          if firstPage
+            where.modifiedAt.$gt = localMaxModified
           else
+            where.modifiedAt.$gte = localMaxModified
+          original.$post "/api/#{endpoint}/search#{if all then '/all' else ''}",
+            where: where
+            sort: 'modifiedAt'
+            sortDir: 'ASC'
+            page: 1
+            pageSize: PAGE_SIZE
+          .then (modifiedDocs) ->
+            console.log modifiedDocs.data.total, 'total'
+            if modifiedDocs.data and modifiedDocs.data.total
+              async.each modifiedDocs.data.items, (modifiedDoc, upsertCb) ->
+                ndx.database.upsert localEndpoint, modifiedDoc
+                upsertCb()
+              , ->
+                totalFetched += modifiedDocs.data?.total or 0
+                if modifiedDocs.data.total > PAGE_SIZE
+                  fetchPage()
+                else
+                  endpointCb?()
+            else
+              endpointCb?()
+          , ->
             endpointCb?()
-        , ->
-          endpointCb?()
+      fetchPage true
     fetchNewData = (cb) ->
       if endpoints and endpoints.endpoints
         async.each endpoints.endpoints, (endpoint, endpointCb) ->
@@ -270,15 +326,18 @@ module.provider 'Server', ->
           cb?()
     fetchCount = 0
     fetchAndUpload = (data) ->
+      totalFetched = 0
       if data
         fetchNewForEndpoint data.table, true, ->
           fetchNewForEndpoint data.table, false, ->
             uploadEndpoints ->
-              rest.socketRefresh data
+              if totalFetched > 0
+                rest.socketRefresh data
       else
         if fetchCount++ > 0
           fetchNewData ->
-            rest.socketRefresh data
+            if totalFetched > 0
+              rest.socketRefresh data
     deleteEndpoint = (endpoint, all) ->
       localEndpoint = endpoint
       if not all or not config.sharedAll
@@ -314,12 +373,13 @@ module.provider 'Server', ->
       #check for refresh
       checkRefresh()
       fetchNewData()
-    ndx.app.get '/rest/endpoints', (req, res, next) ->
+    ndx.app.get null, '/rest/endpoints', (req, res, next) ->
       if isOnline()
         original.$get '/rest/endpoints', req.data
         .then (response) ->
           LocalSettings.setGlobal 'endpoints', response.data
           endpoints = response.data
+          console.log 'endpoints', endpoints
           makeEndpointRoutes()
           makeTables()
           checkRefresh()
@@ -338,7 +398,7 @@ module.provider 'Server', ->
         makeEndpointRoutes()
         makeTables()
         res.json endpoints
-    ndx.app.post '/api/refresh-login', (req, res, next) ->
+    ndx.app.post null, '/api/refresh-login', (req, res, next) ->
       if isOnline()
         original.$post '/api/refresh-login', req.data
         .then (response) ->
@@ -368,7 +428,7 @@ module.provider 'Server', ->
           res.json loggedInUser.user
         else
           res.status(401).json {}
-    ndx.app.get '/api/logout', (req, res, next) ->
+    ndx.app.get null, '/api/logout', (req, res, next) ->
       LocalSettings.setGlobal 'loggedInUser', null
       original.$get req.uri, req.data
       .then ->
@@ -376,7 +436,7 @@ module.provider 'Server', ->
       , ->
         false
       res.end 'OK'
-    ndx.app.post '/api/login', (req, res, next) ->
+    ndx.app.post null, '/api/login', (req, res, next) ->
       original.$post req.uri, req.body
       .then (response) ->
         res.json response.data

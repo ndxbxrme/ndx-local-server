@@ -17,10 +17,10 @@
     };
     return {
       $get: function($http, $q, $rootElement, $window, LocalSettings, Auth, ndxdb, socket, rest) {
-        var Ndx, Req, Res, autoId, checkRefresh, deleteEndpoint, deleteFn, endpoints, fetchAndUpload, fetchCount, fetchNewData, fetchNewForEndpoint, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, uploadEndpoints, upsertFn;
+        var Ndx, Req, Res, autoId, checkRefresh, deleteEndpoint, deleteFn, endpoints, fetchAndUpload, fetchCount, fetchNewData, fetchNewForEndpoint, getRestrict, hasDeleted, isOnline, makeEndpointRoutes, makeRegex, makeTables, ndx, offline, original, ref, selectFn, totalFetched, uploadEndpoints, upsertFn;
         autoId = ((ref = LocalSettings.getGlobal('endpoints')) != null ? ref.autoId : void 0) || '_id';
         offline = LocalSettings.getGlobal('offline');
-        endpoints = [];
+        endpoints = null;
         original = {
           $post: $http.post,
           $get: $http.get,
@@ -43,12 +43,14 @@
         isOnline = function() {
           return !offline;
         };
-        Req = function(method, uri, config, params) {
+        Req = function(method, uri, config, params, endpoint, restrict) {
           return {
             uri: uri,
             method: method,
+            endpoint: endpoint,
             body: config || {},
-            params: params
+            params: params,
+            restrict: restrict
           };
         };
         Res = function(method, uri, config, defer) {
@@ -89,14 +91,15 @@
           makeRoute = function(method, route, args) {
             var i, myroute;
             myroute = makeRegex(route);
-            i = 0;
+            i = 1;
             while (i++ < args.length - 1) {
               myroute.fns.push(args[i]);
             }
+            myroute.endpoint = args[0];
             return routes[method].push(myroute);
           };
           routeRequest = function(method, uri, config) {
-            var callFn, defer, ex, i, j, k, len, len1, param, params, ref1, ref2, req, res, route, testroute;
+            var callFn, defer, ex, i, j, k, len, len1, param, params, ref1, ref2, req, res, restrict, route, testroute;
             route = null;
             ref1 = routes[method];
             for (j = 0, len = ref1.length; j < len; j++) {
@@ -107,6 +110,10 @@
               }
             }
             if (route) {
+              restrict = getRestrict(route.endpoint);
+              if (restrict.local) {
+                return original['$' + method](uri, config);
+              }
               defer = $q.defer();
               callFn = function(index, req, res) {
                 if (route.fns[index]) {
@@ -124,7 +131,7 @@
                 console.log(decodeURIComponent(ex[i + 1]));
                 params[param] = decodeURIComponent(ex[i + 1]);
               }
-              req = Req(method, uri, config, params);
+              req = Req(method, uri, config, params, route.endpoint, restrict);
               res = Res(method, uri, config, defer);
               callFn(0, req, res);
               return defer.promise;
@@ -135,7 +142,7 @@
           return {
             app: {
               routeRequest: routeRequest,
-              get: function(route) {
+              get: function(endpoint, route) {
                 var j, len, r, results;
                 if (Object.prototype.toString.call(route) === '[object Array]') {
                   results = [];
@@ -148,7 +155,7 @@
                   return makeRoute('get', route, arguments);
                 }
               },
-              post: function(route) {
+              post: function(endpoint, route) {
                 var j, len, r, results;
                 if (Object.prototype.toString.call(route) === '[object Array]') {
                   results = [];
@@ -161,7 +168,7 @@
                   return makeRoute('post', route, arguments);
                 }
               },
-              put: function(route) {
+              put: function(endpoint, route) {
                 var j, len, r, results;
                 if (Object.prototype.toString.call(route) === '[object Array]') {
                   results = [];
@@ -174,7 +181,7 @@
                   return makeRoute('put', route, arguments);
                 }
               },
-              delete: function(route) {
+              delete: function(endpoint, route) {
                 var j, len, r, results;
                 if (Object.prototype.toString.call(route) === '[object Array]') {
                   results = [];
@@ -213,11 +220,44 @@
           }
           return truth;
         };
+        getRestrict = function(tableName) {
+          var key, restrict, role, tableRestrict, user;
+          if (endpoints) {
+            if (endpoints.restrict) {
+              role = null;
+              restrict = null;
+              if (user = Auth.getUser()) {
+                if (user.roles) {
+                  for (key in user.roles) {
+                    if (user.roles[key]) {
+                      role = key;
+                      break;
+                    }
+                  }
+                }
+              }
+              tableRestrict = endpoints.restrict[tableName] || endpoints.restrict.default;
+              if (tableRestrict) {
+                return tableRestrict[role] || tableRestrict.default || {};
+              }
+            }
+          }
+          return {};
+        };
         selectFn = function(tableName, all) {
           return function(req, res, next) {
-            var myTableName, where;
+            var myTableName, restrict, where;
             myTableName = tableName;
-            if (!all || !config.sharedAll) {
+            restrict = req.restrict;
+            if (all && restrict.all) {
+              return res.json({
+                total: 0,
+                page: 1,
+                pageSize: 0,
+                items: []
+              });
+            }
+            if (!all || !restrict.sharedAll) {
               myTableName += `_${(Auth.getUser()._id)}`;
             }
             if (all) {
@@ -318,29 +358,29 @@
           results = [];
           for (j = 0, len = ref1.length; j < len; j++) {
             endpoint = ref1[j];
-            ndx.app.get([`/api/${endpoint}`, `/api/${endpoint}/:id`], selectFn(endpoint));
-            ndx.app.post(`/api/${endpoint}/search`, selectFn(endpoint));
-            if (endpoints.restrict && endpoints.restrict[endpoint] && endpoints.restrict[endpoint].all) {
-              true;
-            } else {
-              ndx.app.get(`/api/${endpoint}/:id/all`, selectFn(endpoint, true));
-              ndx.app.post(`/api/${endpoint}/search/all`, selectFn(endpoint, true));
-            }
-            //ndx.app.post "/api/#{endpoint}/modified", modifiedFn(endpoint)
-            ndx.app.post([`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
-            ndx.app.put([`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
-            results.push(ndx.app.delete(`/api/${endpoint}/:id`, deleteFn(endpoint)));
+            ndx.app.get(endpoint, [`/api/${endpoint}`, `/api/${endpoint}/:id`], selectFn(endpoint));
+            ndx.app.post(endpoint, `/api/${endpoint}/search`, selectFn(endpoint));
+            ndx.app.get(endpoint, `/api/${endpoint}/:id/all`, selectFn(endpoint, true));
+            ndx.app.post(endpoint, `/api/${endpoint}/search/all`, selectFn(endpoint, true));
+            //ndx.app.post endpoint, "/api/#{endpoint}/modified", modifiedFn(endpoint)
+            ndx.app.post(endpoint, [`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
+            ndx.app.put(endpoint, [`/api/${endpoint}`, `/api/${endpoint}/:id`], upsertFn(endpoint));
+            results.push(ndx.app.delete(endpoint, `/api/${endpoint}/:id`, deleteFn(endpoint)));
           }
           return results;
         };
         makeTables = function() {
-          var endpoint, j, k, len, len1, myTableName, ref1, ref2, results;
+          var endpoint, j, k, len, len1, myTableName, ref1, ref2, restrict, results;
           if (endpoints && endpoints.endpoints) {
             ref1 = endpoints.endpoints;
             for (j = 0, len = ref1.length; j < len; j++) {
               endpoint = ref1[j];
               myTableName = endpoint;
-              if (!config.sharedAll) {
+              restrict = getRestrict(myTableName);
+              if (restrict.all || restrict.localAll) {
+                continue;
+              }
+              if (!restrict.sharedAll) {
                 myTableName += `_${(Auth.getUser()._id)}`;
               }
               myTableName += "_all";
@@ -352,6 +392,10 @@
             results = [];
             for (k = 0, len1 = ref2.length; k < len1; k++) {
               endpoint = ref2[k];
+              restrict = getRestrict(endpoint);
+              if (restrict.local) {
+                continue;
+              }
               results.push(ndx.database.makeTable(`${endpoint}_${(Auth.getUser()._id)}`));
             }
             return results;
@@ -360,7 +404,11 @@
         uploadEndpoints = function(cb) {
           if (endpoints && endpoints.endpoints && Auth.getUser()) {
             return async.each(endpoints.endpoints, function(endpoint, endpointCb) {
-              var myTableName;
+              var myTableName, restrict;
+              restrict = getRestrict(endpoint);
+              if (restrict.local) {
+                return endpointCb();
+              }
               myTableName = `${endpoint}_${(Auth.getUser()._id)}`;
               return ndx.database.getDocsToUpload(myTableName, function(docs) {
                 if (docs) {
@@ -378,40 +426,68 @@
             });
           }
         };
+        totalFetched = 0;
         fetchNewForEndpoint = function(endpoint, all, endpointCb) {
-          var localEndpoint;
+          var PAGE_SIZE, fetchPage, localEndpoint, restrict;
           if (!Auth.getUser()) {
             return typeof endpointCb === "function" ? endpointCb() : void 0;
           }
           localEndpoint = endpoint;
+          restrict = getRestrict(localEndpoint);
+          if (restrict.local) {
+            return typeof endpointCb === "function" ? endpointCb() : void 0;
+          }
+          if (all && (restrict.all || restrict.localAll)) {
+            return typeof endpointCb === "function" ? endpointCb() : void 0;
+          }
           if (!all || !config.sharedAll) {
             localEndpoint += `_${(Auth.getUser()._id)}`;
           }
           if (all) {
             localEndpoint += "_all";
           }
-          return ndx.database.maxModified(localEndpoint, function(localMaxModified) {
-            return original.$post(`/api/${endpoint}/search${(all ? '/all' : '')}`, {
-              where: {
-                modifiedAt: {
-                  $gt: localMaxModified
-                }
-              }
-            }).then(function(modifiedDocs) {
-              if (modifiedDocs.data && modifiedDocs.data.total) {
-                return async.each(modifiedDocs.data.items, function(modifiedDoc, upsertCb) {
-                  ndx.database.upsert(localEndpoint, modifiedDoc);
-                  return upsertCb();
-                }, function() {
-                  return typeof endpointCb === "function" ? endpointCb() : void 0;
-                });
+          PAGE_SIZE = 10;
+          fetchPage = function(firstPage) {
+            return ndx.database.maxModified(localEndpoint, function(localMaxModified) {
+              var where;
+              where = {
+                modifiedAt: {}
+              };
+              if (firstPage) {
+                where.modifiedAt.$gt = localMaxModified;
               } else {
-                return typeof endpointCb === "function" ? endpointCb() : void 0;
+                where.modifiedAt.$gte = localMaxModified;
               }
-            }, function() {
-              return typeof endpointCb === "function" ? endpointCb() : void 0;
+              return original.$post(`/api/${endpoint}/search${(all ? '/all' : '')}`, {
+                where: where,
+                sort: 'modifiedAt',
+                sortDir: 'ASC',
+                page: 1,
+                pageSize: PAGE_SIZE
+              }).then(function(modifiedDocs) {
+                console.log(modifiedDocs.data.total, 'total');
+                if (modifiedDocs.data && modifiedDocs.data.total) {
+                  return async.each(modifiedDocs.data.items, function(modifiedDoc, upsertCb) {
+                    ndx.database.upsert(localEndpoint, modifiedDoc);
+                    return upsertCb();
+                  }, function() {
+                    var ref1;
+                    totalFetched += ((ref1 = modifiedDocs.data) != null ? ref1.total : void 0) || 0;
+                    if (modifiedDocs.data.total > PAGE_SIZE) {
+                      return fetchPage();
+                    } else {
+                      return typeof endpointCb === "function" ? endpointCb() : void 0;
+                    }
+                  });
+                } else {
+                  return typeof endpointCb === "function" ? endpointCb() : void 0;
+                }
+              }, function() {
+                return typeof endpointCb === "function" ? endpointCb() : void 0;
+              });
             });
-          });
+          };
+          return fetchPage(true);
         };
         fetchNewData = function(cb) {
           if (endpoints && endpoints.endpoints) {
@@ -428,18 +504,23 @@
         };
         fetchCount = 0;
         fetchAndUpload = function(data) {
+          totalFetched = 0;
           if (data) {
             return fetchNewForEndpoint(data.table, true, function() {
               return fetchNewForEndpoint(data.table, false, function() {
                 return uploadEndpoints(function() {
-                  return rest.socketRefresh(data);
+                  if (totalFetched > 0) {
+                    return rest.socketRefresh(data);
+                  }
                 });
               });
             });
           } else {
             if (fetchCount++ > 0) {
               return fetchNewData(function() {
-                return rest.socketRefresh(data);
+                if (totalFetched > 0) {
+                  return rest.socketRefresh(data);
+                }
               });
             }
           }
@@ -499,11 +580,12 @@
           checkRefresh();
           return fetchNewData();
         });
-        ndx.app.get('/rest/endpoints', function(req, res, next) {
+        ndx.app.get(null, '/rest/endpoints', function(req, res, next) {
           if (isOnline()) {
             return original.$get('/rest/endpoints', req.data).then(function(response) {
               LocalSettings.setGlobal('endpoints', response.data);
               endpoints = response.data;
+              console.log('endpoints', endpoints);
               makeEndpointRoutes();
               makeTables();
               checkRefresh();
@@ -526,7 +608,7 @@
             return res.json(endpoints);
           }
         });
-        ndx.app.post('/api/refresh-login', function(req, res, next) {
+        ndx.app.post(null, '/api/refresh-login', function(req, res, next) {
           var loggedInUser;
           if (isOnline()) {
             return original.$post('/api/refresh-login', req.data).then(function(response) {
@@ -565,7 +647,7 @@
             }
           }
         });
-        ndx.app.get('/api/logout', function(req, res, next) {
+        ndx.app.get(null, '/api/logout', function(req, res, next) {
           LocalSettings.setGlobal('loggedInUser', null);
           original.$get(req.uri, req.data).then(function() {
             return true;
@@ -574,7 +656,7 @@
           });
           return res.end('OK');
         });
-        ndx.app.post('/api/login', function(req, res, next) {
+        ndx.app.post(null, '/api/login', function(req, res, next) {
           return original.$post(req.uri, req.body).then(function(response) {
             return res.json(response.data);
           }, function(err) {
